@@ -151,6 +151,11 @@
       100% { transform: translate3d(-18px, 22px, 0) scale(0.95); }
     }
 
+    /* Pause ambient CSS blur animations during active gameplay for locked 60fps */
+    body.game-playing .bokeh-orb {
+      animation-play-state: paused;
+    }
+
     .custom-bg-layer {
       position: absolute;
       inset: 0;
@@ -410,7 +415,20 @@
       max-width: 480px;
       margin: 0 auto;
     }
-    .tab-screen.active { display: flex; }
+    .tab-screen.active {
+      display: flex;
+      animation: tabScreenIn 0.28s var(--spring) both;
+    }
+    @keyframes tabScreenIn {
+      from {
+        opacity: 0;
+        transform: translate3d(0, 8px, 0);
+      }
+      to {
+        opacity: 1;
+        transform: translate3d(0, 0, 0);
+      }
+    }
 
     .screen-static-header {
       flex-shrink: 0;
@@ -743,6 +761,8 @@
       width: 100%;
       height: 100%;
       touch-action: none;
+      will-change: transform;
+      transform: translateZ(0);
     }
     .flappy-hud {
       position: absolute;
@@ -1046,12 +1066,20 @@
       width: calc((100% - 10px) / 4);
       height: calc(100% - 10px);
       border-radius: var(--radius-pill);
-      background: transparent;
-      border: 1.5px solid rgba(90, 226, 255, 0.78);
+      background: rgba(90, 226, 255, 0.08);
+      border: 1.5px solid rgba(90, 226, 255, 0.82);
       box-shadow: none;
-      transition: transform 0.32s var(--spring);
+      will-change: transform;
+      transform: translate3d(calc(var(--tab-idx, 0) * 100%), 0, 0) scaleX(1) scaleY(1);
+      transition:
+        transform 0.42s cubic-bezier(0.32, 1.28, 0.46, 1),
+        border-color 0.25s ease,
+        background-color 0.25s ease;
       pointer-events: none;
       z-index: 0;
+    }
+    .tabbar-indicator.gliding {
+      transform: translate3d(calc(var(--tab-idx, 0) * 100%), 0, 0) scaleX(1.12) scaleY(0.92);
     }
 
     .tab-btn {
@@ -1064,11 +1092,15 @@
       align-items: center;
       justify-content: center;
       gap: 3px;
-      color: rgba(255, 255, 255, 0.78);
-      transition: color 0.2s ease;
+      color: rgba(255, 255, 255, 0.76);
+      transition: color 0.26s ease, transform 0.22s var(--spring);
     }
-    .tab-btn:active { opacity: 0.72; }
-    .tab-btn.active { color: var(--accent-cyan); }
+    .tab-btn:active {
+      transform: scale(0.93);
+    }
+    .tab-btn.active {
+      color: var(--accent-cyan);
+    }
     .tab-btn svg {
       width: 20px;
       height: 20px;
@@ -1078,6 +1110,11 @@
       stroke-width: 1.9;
       stroke-linecap: round;
       stroke-linejoin: round;
+      transition: transform 0.36s cubic-bezier(0.34, 1.56, 0.64, 1);
+      will-change: transform;
+    }
+    .tab-btn.active svg {
+      transform: translate3d(0, -1.5px, 0) scale(1.1);
     }
     .tab-btn span {
       font-size: 10.5px;
@@ -1087,6 +1124,10 @@
       overflow: hidden;
       text-overflow: ellipsis;
       max-width: 100%;
+      transition: transform 0.28s var(--spring), opacity 0.22s ease;
+    }
+    .tab-btn.active span {
+      transform: translate3d(0, -0.5px, 0);
     }
     .tab-badge {
       position: absolute;
@@ -1745,7 +1786,7 @@
          3. GLOBAL STATE & UTILITIES
          ====================================================================== */
       const State = {
-        user: { name: 'Игрок', username: '', photoUrl: '' },
+        user: { id: '', name: 'Игрок', username: '', photoUrl: '' },
         session: {
           pairCode: null,
           role: null,
@@ -1918,8 +1959,9 @@
 
           const u = tg.initDataUnsafe?.user;
           if (u) {
+            State.user.id = u.id ? String(u.id) : '';
             State.user.name = [u.first_name, u.last_name].filter(Boolean).join(' ').trim() || u.username || 'Игрок';
-            State.user.username = u.username || '';
+            State.user.username = (u.username || '').trim();
             State.user.photoUrl = u.photo_url || '';
           }
         }
@@ -2360,106 +2402,864 @@
       }
 
       /* ======================================================================
-         8. REALTIME DATABASE ENGINE (FIREBASE + LOCAL DEMO FALLBACK)
+         8. DATABASE ENGINE (FIREBASE RTDB + TELEGRAM ACCOUNT AUTO-LOGIN + DEMO)
          ====================================================================== */
       const DB = {
         rtdb: null,
-        unsubRef: null,
-        channel: null,
+        activeRef: null,
+        activeCb: null,
+        bc: null,
+        demoCode: null,
+        demoCb: null,
+
+        sanitizeUsername(username) {
+          return String(username || '')
+            .trim()
+            .replace(/^@/, '')
+            .toLowerCase()
+            .replace(/[^a-z0-9_]/g, '');
+        },
 
         async init() {
-          const hasUrl = Boolean(FIREBASE_CONFIG.databaseURL && FIREBASE_CONFIG.databaseURL.trim());
-          if (hasUrl && window.firebase) {
+          const dbUrl = (FIREBASE_CONFIG.databaseURL || '').trim();
+          if (dbUrl && window.firebase && typeof window.firebase.database === 'function') {
             try {
-              if (!firebase.apps.length) firebase.initializeApp(FIREBASE_CONFIG);
-              this.rtdb = firebase.database();
+              if (!window.firebase.apps.length) {
+                window.firebase.initializeApp(FIREBASE_CONFIG);
+              }
+              this.rtdb = window.firebase.database();
               State.isOnlineDb = true;
               return;
-            } catch (e) {
-              console.warn('Firebase init fallback:', e);
+            } catch (err) {
+              console.warn('Firebase init fallback to demo:', err);
             }
           }
+
           State.isOnlineDb = false;
           try {
-            this.channel = new BroadcastChannel('lovequest_demo_sync');
+            if (typeof BroadcastChannel !== 'undefined') {
+              this.bc = new BroadcastChannel('lovequest_demo_sync');
+              this.bc.onmessage = ev => {
+                if (ev.data && ev.data.code === this.demoCode && this.demoCb) {
+                  this.demoCb(normalizePairData(ev.data.data, this.demoCode));
+                }
+              };
+            }
           } catch (_) {}
         },
 
-        localKey(code) {
-          return `lovequest_local_pair_${code}`;
-        },
-
         async get(code) {
+          if (!code) return null;
           if (this.rtdb) {
-            const snap = await this.rtdb.ref(`pairs/${code}`).once('value');
-            const val = snap.val();
-            return val ? normalizePairData(val, code) : null;
+            try {
+              const snap = await this.rtdb.ref(`pairs/${code}`).once('value');
+              return normalizePairData(snap.val(), code);
+            } catch (err) {
+              console.warn('DB.get error:', err);
+              return null;
+            }
           }
           try {
-            const raw = JSON.parse(localStorage.getItem(this.localKey(code)) || 'null');
-            return raw ? normalizePairData(raw, code) : null;
+            const raw = JSON.parse(localStorage.getItem(`lovequest_demo_pair_${code}`) || 'null');
+            return normalizePairData(raw, code);
           } catch (_) {
             return null;
           }
         },
 
         async set(code, data) {
+          if (!code || !data) return;
           if (this.rtdb) {
-            await this.rtdb.ref(`pairs/${code}`).set(data);
+            try {
+              await this.rtdb.ref(`pairs/${code}`).set(data);
+            } catch (err) {
+              console.warn('DB.set error:', err);
+            }
             return;
           }
-          localStorage.setItem(this.localKey(code), JSON.stringify(data));
-          this.channel?.postMessage({ code, data });
+          try {
+            localStorage.setItem(`lovequest_demo_pair_${code}`, JSON.stringify(data));
+            this.bc?.postMessage({ code, data });
+            if (this.demoCode === code && this.demoCb) {
+              this.demoCb(normalizePairData(data, code));
+            }
+          } catch (_) {}
         },
 
         async transact(code, mutatorFn) {
+          if (!code) return null;
           if (this.rtdb) {
-            let committedData = null;
-            await this.rtdb.ref(`pairs/${code}`).transaction(current => {
-              if (!current) return; // abort without deleting
-              const norm = normalizePairData(current, code);
-              const updated = mutatorFn(norm);
-              if (!updated) return; // undefined aborts transaction safely
-              committedData = updated;
-              return updated;
-            });
-            return committedData;
+            try {
+              const ref = this.rtdb.ref(`pairs/${code}`);
+              const res = await ref.transaction(cur => {
+                if (!cur) return undefined;
+                const norm = normalizePairData(cur, code);
+                const next = mutatorFn(norm);
+                return next ? next : undefined;
+              });
+              if (res && res.committed && res.snapshot) {
+                return normalizePairData(res.snapshot.val(), code);
+              }
+              return null;
+            } catch (err) {
+              console.warn('DB.transact error:', err);
+              return null;
+            }
           }
+
           const cur = await this.get(code);
           if (!cur) return null;
-          const updated = mutatorFn(cur);
-          if (!updated) return null;
-          await this.set(code, updated);
-          onPairSnapshot(updated);
-          return updated;
+          const next = mutatorFn(cur);
+          if (!next) return null;
+          await this.set(code, next);
+          return next;
         },
 
-        subscribe(code, onData) {
+        subscribe(code, callback) {
           this.unsubscribe();
+          if (!code) return;
           if (this.rtdb) {
-            const ref = this.rtdb.ref(`pairs/${code}`);
-            const handler = snap => {
+            this.activeRef = this.rtdb.ref(`pairs/${code}`);
+            this.activeCb = snap => {
               const val = snap.val();
-              if (val) onData(normalizePairData(val, code));
+              if (val) callback(normalizePairData(val, code));
             };
-            ref.on('value', handler);
-            this.unsubRef = () => ref.off('value', handler);
-          } else {
-            this.get(code).then(d => { if (d) onData(d); });
-            const bcHandler = ev => {
-              if (ev.data && ev.data.code === code && ev.data.data) {
-                onData(normalizePairData(ev.data.data, code));
-              }
-            };
-            if (this.channel) this.channel.onmessage = bcHandler;
-            this.unsubRef = () => { if (this.channel) this.channel.onmessage = null; };
+            this.activeRef.on('value', this.activeCb);
+            return;
           }
+          this.demoCode = code;
+          this.demoCb = callback;
         },
 
         unsubscribe() {
-          if (this.unsubRef) {
-            this.unsubRef();
-            this.unsubRef = null;
+          if (this.activeRef && this.activeCb) {
+            try { this.activeRef.off('value', this.activeCb); } catch (_) {}
+          }
+          this.activeRef = null;
+          this.activeCb = null;
+          this.demoCode = null;
+          this.demoCb = null;
+        },
+
+        // Bind Telegram username & ID inside /pairs/_accounts so updates never reset login
+        async bindAccount(user, pairCode, role) {
+          if (!user || !pairCode || !role) return;
+          const uKey = this.sanitizeUsername(user.username);
+          const idKey = user.id ? String(user.id).replace(/\D/g, '') : '';
+          if (!uKey && !idKey) return;
+
+          const payload = {
+            pairCode: String(pairCode),
+            role,
+            username: uKey,
+            tgId: idKey,
+            updatedAt: Date.now()
+          };
+
+          if (this.rtdb) {
+            const ops = [];
+            if (uKey) ops.push(this.rtdb.ref(`pairs/_accounts/u_${uKey}`).set(payload));
+            if (idKey) ops.push(this.rtdb.ref(`pairs/_accounts/id_${idKey}`).set(payload));
+            try { await Promise.all(ops); } catch (err) { console.warn('bindAccount error:', err); }
+            return;
+          }
+
+          try {
+            if (uKey) localStorage.setItem(`lovequest_demo_acc_u_${uKey}`, JSON.stringify(payload));
+            if (idKey) localStorage.setItem(`lovequest_demo_acc_id_${idKey}`, JSON.stringify(payload));
+          } catch (_) {}
+        },
+
+        async findAccountBinding(user) {
+          if (!user) return null;
+          const uKey = this.sanitizeUsername(user.username);
+          const idKey = user.id ? String(user.id).replace(/\D/g, '') : '';
+          if (!uKey && !idKey) return null;
+
+          const readKey = async key => {
+            if (this.rtdb) {
+              try {
+                const snap = await this.rtdb.ref(`pairs/_accounts/${key}`).once('value');
+                return snap.val() || null;
+              } catch (_) {
+                return null;
+              }
+            }
+            try {
+              return JSON.parse(localStorage.getItem(`lovequest_demo_acc_${key}`) || 'null');
+            } catch (_) {
+              return null;
+            }
+          };
+
+          if (uKey) {
+            const byUser = await readKey(`u_${uKey}`);
+            if (byUser && byUser.pairCode && byUser.role) return byUser;
+          }
+          if (idKey) {
+            const byId = await readKey(`id_${idKey}`);
+            if (byId && byId.pairCode && byId.role) return byId;
+          }
+          return null;
+        },
+
+        async unbindAccount(user) {
+          if (!user) return;
+          const uKey = this.sanitizeUsername(user.username);
+          const idKey = user.id ? String(user.id).replace(/\D/g, '') : '';
+          if (!uKey && !idKey) return;
+
+          if (this.rtdb) {
+            const ops = [];
+            if (uKey) ops.push(this.rtdb.ref(`pairs/_accounts/u_${uKey}`).remove());
+            if (idKey) ops.push(this.rtdb.ref(`pairs/_accounts/id_${idKey}`).remove());
+            try { await Promise.all(ops); } catch (_) {}
+            return;
+          }
+
+          try {
+            if (uKey) localStorage.removeItem(`lovequest_demo_acc_u_${uKey}`);
+            if (idKey) localStorage.removeItem(`lovequest_demo_acc_id_${idKey}`);
+          } catch (_) {}
+        }
+      };
+
+      /* ======================================================================
+         10. FLAPPY LOVE MINI-GAME (60FPS OPTIMIZED — PRE-RENDERED SPRITES)
+         ====================================================================== */
+      const FlappyGame = {
+        canvas: null,
+        ctx: null,
+        w: 320,
+        h: 400,
+        dpr: 1,
+        rafId: null,
+        idleRafId: null,
+        lastTs: 0,
+        accumulator: 0,
+        FIXED_DT: 1 / 120,
+        PIPE_W: 54,
+        GROUND_H: 38,
+        state: 'idle',
+        bird: { x: 86, y: 170, vy: 0, r: 18, rot: 0 },
+        pipes: [],
+        coins: [],
+        popups: [],
+        groundOffset: 0,
+        spawnTimer: 0,
+        pipesPassed: 0,
+        coinsEarned: 0,
+        pipeCounter: 0,
+        avatarImg: null,
+        avatarSrc: '',
+        avatarReady: false,
+        // Cached GPU-friendly resources (zero per-frame allocation)
+        skyGrad: null,
+        pipeGrad: null,
+        birdSprite: null,
+        birdSpriteSize: 0,
+        coinSprite: null,
+        coinSpriteSize: 0,
+
+        init() {
+          this.canvas = document.getElementById('flappy-canvas');
+          if (!this.canvas) return;
+          this.ctx = this.canvas.getContext('2d', { alpha: true });
+          this.buildCoinSprite();
+          this.buildBirdSprite();
+          this.resize();
+
+          window.addEventListener('resize', () => {
+            if (State.activeTab === 'games') this.resize();
+          });
+
+          this.canvas.addEventListener('pointerdown', e => {
+            e.preventDefault();
+            if (this.state === 'playing') this.flap();
+            else if (this.state === 'idle') this.start();
+          }, { passive: false });
+
+          document.getElementById('btn-flappy-start')?.addEventListener('click', () => this.start());
+
+          document.addEventListener('keydown', e => {
+            if (State.activeTab !== 'games') return;
+            if (e.code === 'Space' || e.code === 'ArrowUp') {
+              e.preventDefault();
+              if (this.state === 'playing') this.flap();
+              else this.start();
+            }
+          });
+
+          document.addEventListener('visibilitychange', () => {
+            if (document.hidden) {
+              if (this.state === 'playing') this.stopIfRunning(true);
+              this.stopIdleLoop();
+            } else if (State.activeTab === 'games' && this.state === 'idle') {
+              this.startIdleLoop();
+            }
+          });
+          this.drawFrame(0);
+        },
+
+        getMyAvatarInfo() {
+          const isGf = State.session.role === 'girlfriend';
+          const meta = State.pairData?.meta || {};
+          const custom = isGf ? meta.girlfriendCustomAvatar : meta.boyfriendCustomAvatar;
+          const url = custom || State.user.photoUrl || (isGf ? meta.girlfriendPhotoUrl : meta.boyfriendPhotoUrl) || '';
+          const name = State.user.name || (isGf ? 'Девушка' : 'Парень');
+          return { url, initial: name.slice(0, 1).toUpperCase() || '💞' };
+        },
+
+        // Pre-render glowing golden coin once to avoid costly ctx.shadowBlur per frame
+        buildCoinSprite() {
+          const dpr = Math.min(window.devicePixelRatio || 1, 2);
+          const r = 13;
+          const pad = 12;
+          const logicalSize = (r + pad) * 2;
+          const c = document.createElement('canvas');
+          c.width = Math.round(logicalSize * dpr);
+          c.height = Math.round(logicalSize * dpr);
+          const g = c.getContext('2d');
+          g.setTransform(dpr, 0, 0, dpr, 0, 0);
+          const cx = logicalSize / 2;
+          const cy = logicalSize / 2;
+
+          // Soft baked glow halo
+          const halo = g.createRadialGradient(cx, cy, r * 0.5, cx, cy, r + pad);
+          halo.addColorStop(0, 'rgba(255, 209, 102, 0.55)');
+          halo.addColorStop(0.6, 'rgba(255, 209, 102, 0.18)');
+          halo.addColorStop(1, 'rgba(255, 209, 102, 0)');
+          g.fillStyle = halo;
+          g.beginPath();
+          g.arc(cx, cy, r + pad, 0, Math.PI * 2);
+          g.fill();
+
+          // Coin body
+          const cg = g.createRadialGradient(cx - 3, cy - 3, 2, cx, cy, r);
+          cg.addColorStop(0, '#fff7b2');
+          cg.addColorStop(0.6, '#ffd166');
+          cg.addColorStop(1, '#f4a226');
+          g.fillStyle = cg;
+          g.beginPath();
+          g.arc(cx, cy, r, 0, Math.PI * 2);
+          g.fill();
+          g.lineWidth = 2;
+          g.strokeStyle = 'rgba(255, 255, 255, 0.88)';
+          g.stroke();
+
+          g.fillStyle = '#5c3400';
+          g.font = '800 10px -apple-system, sans-serif';
+          g.textAlign = 'center';
+          g.textBaseline = 'middle';
+          g.fillText('10', cx, cy + 0.5);
+
+          this.coinSprite = c;
+          this.coinSpriteSize = logicalSize;
+        },
+
+        // Pre-render circular clipped avatar once to eliminate per-frame ctx.clip()
+        buildBirdSprite() {
+          const dpr = Math.min(window.devicePixelRatio || 1, 2);
+          const r = this.bird.r;
+          const ringPad = 4;
+          const logicalSize = (r + ringPad) * 2;
+          const c = document.createElement('canvas');
+          c.width = Math.round(logicalSize * dpr);
+          c.height = Math.round(logicalSize * dpr);
+          const g = c.getContext('2d');
+          g.setTransform(dpr, 0, 0, dpr, 0, 0);
+          const cx = logicalSize / 2;
+          const cy = logicalSize / 2;
+
+          // Outer cyan ring
+          g.beginPath();
+          g.arc(cx, cy, r + 2.5, 0, Math.PI * 2);
+          g.fillStyle = 'rgba(90, 226, 255, 0.92)';
+          g.fill();
+
+          // Circular clipped avatar
+          g.save();
+          g.beginPath();
+          g.arc(cx, cy, r, 0, Math.PI * 2);
+          g.clip();
+          if (this.avatarReady && this.avatarImg) {
+            g.drawImage(this.avatarImg, cx - r, cy - r, r * 2, r * 2);
+          } else {
+            const ag = g.createLinearGradient(cx - r, cy - r, cx + r, cy + r);
+            ag.addColorStop(0, '#ff6ba9');
+            ag.addColorStop(1, '#7b4dff');
+            g.fillStyle = ag;
+            g.fillRect(cx - r, cy - r, r * 2, r * 2);
+            g.fillStyle = '#fff';
+            g.font = '800 16px -apple-system, sans-serif';
+            g.textAlign = 'center';
+            g.textBaseline = 'middle';
+            g.fillText(this.getMyAvatarInfo().initial, cx, cy + 1);
+          }
+          g.restore();
+
+          this.birdSprite = c;
+          this.birdSpriteSize = logicalSize;
+        },
+
+        rebuildGradients() {
+          if (!this.ctx) return;
+          const sky = this.ctx.createLinearGradient(0, 0, 0, this.h);
+          sky.addColorStop(0, 'rgba(34, 14, 48, 0.42)');
+          sky.addColorStop(1, 'rgba(66, 20, 56, 0.32)');
+          this.skyGrad = sky;
+
+          const pipe = this.ctx.createLinearGradient(0, 0, this.PIPE_W, 0);
+          pipe.addColorStop(0, 'rgba(255, 107, 169, 0.74)');
+          pipe.addColorStop(0.5, 'rgba(255, 175, 212, 0.86)');
+          pipe.addColorStop(1, 'rgba(182, 68, 136, 0.80)');
+          this.pipeGrad = pipe;
+        },
+
+        syncAvatarImage() {
+          const { url } = this.getMyAvatarInfo();
+          if (url === this.avatarSrc) {
+            if (!this.birdSprite) this.buildBirdSprite();
+            return;
+          }
+          this.avatarSrc = url;
+          this.avatarReady = false;
+          if (!url) {
+            this.avatarImg = null;
+            this.buildBirdSprite();
+            if (this.state !== 'playing') this.drawFrame(0);
+            return;
+          }
+          const img = new Image();
+          img.referrerPolicy = 'no-referrer';
+          img.onload = () => {
+            this.avatarImg = img;
+            this.avatarReady = true;
+            this.buildBirdSprite();
+            if (this.state !== 'playing') this.drawFrame(0);
+          };
+          img.onerror = () => {
+            this.avatarImg = null;
+            this.avatarReady = false;
+            this.buildBirdSprite();
+          };
+          img.src = url.startsWith('data:image/')
+            ? url
+            : `${url}${url.includes('?') ? '&' : '?'}_v=${SESSION_CACHE_BUST}`;
+        },
+
+        resize() {
+          const wrap = document.getElementById('flappy-stage');
+          if (!wrap || !this.canvas) return;
+          const rect = wrap.getBoundingClientRect();
+          if (rect.width < 20 || rect.height < 20) return;
+          this.dpr = Math.min(window.devicePixelRatio || 1, 2);
+          this.w = rect.width;
+          this.h = rect.height;
+          this.canvas.width = Math.round(this.w * this.dpr);
+          this.canvas.height = Math.round(this.h * this.dpr);
+          this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+          this.rebuildGradients();
+          if (this.state === 'idle') {
+            this.bird.x = Math.round(this.w * 0.27);
+            this.bird.y = Math.round(this.h * 0.44);
+          }
+          this.drawFrame(performance.now());
+        },
+
+        startIdleLoop() {
+          this.stopIdleLoop();
+          if (this.state !== 'idle' || State.activeTab !== 'games') return;
+          const tick = ts => {
+            if (this.state !== 'idle' || State.activeTab !== 'games') {
+              this.idleRafId = null;
+              return;
+            }
+            this.drawFrame(ts);
+            this.idleRafId = requestAnimationFrame(tick);
+          };
+          this.idleRafId = requestAnimationFrame(tick);
+        },
+
+        stopIdleLoop() {
+          if (this.idleRafId) {
+            cancelAnimationFrame(this.idleRafId);
+            this.idleRafId = null;
+          }
+        },
+
+        resetRound() {
+          this.resize();
+          this.syncAvatarImage();
+          this.bird = {
+            x: Math.round(this.w * 0.27),
+            y: Math.round(this.h * 0.44),
+            vy: 0,
+            r: 18,
+            rot: 0
+          };
+          this.pipes = [];
+          this.coins = [];
+          this.popups = [];
+          this.spawnTimer = 0.85;
+          this.pipesPassed = 0;
+          this.coinsEarned = 0;
+          this.pipeCounter = 0;
+          this.accumulator = 0;
+          this.lastTs = 0;
+          this.updateHud();
+        },
+
+        updateHud() {
+          const sEl = document.getElementById('flappy-live-score');
+          const cEl = document.getElementById('flappy-live-coins');
+          const cWrap = document.getElementById('flappy-live-coins-wrap');
+          if (sEl) sEl.textContent = formatNumber(this.pipesPassed);
+          if (cEl) cEl.textContent = formatNumber(this.coinsEarned);
+          if (cWrap) cWrap.style.display = State.session.role === 'girlfriend' ? 'inline-flex' : 'none';
+        },
+
+        start() {
+          this.stopIdleLoop();
+          this.resetRound();
+          this.state = 'playing';
+          document.body.classList.add('game-playing');
+          document.getElementById('flappy-overlay')?.classList.add('hidden');
+          this.flap();
+          cancelAnimationFrame(this.rafId);
+          this.rafId = requestAnimationFrame(ts => this.loop(ts));
+        },
+
+        stopIfRunning(saveProgress = true) {
+          if (this.state === 'playing') {
+            cancelAnimationFrame(this.rafId);
+            this.rafId = null;
+            this.state = 'idle';
+            document.body.classList.remove('game-playing');
+            if (saveProgress && (this.pipesPassed > 0 || this.coinsEarned > 0)) {
+              this.persistRun(this.pipesPassed, this.coinsEarned);
+            }
+            const ov = document.getElementById('flappy-overlay');
+            if (ov) {
+              document.getElementById('flappy-overlay-title').textContent = 'Пауза ✨';
+              document.getElementById('flappy-overlay-sub').textContent = 'Нажми, чтобы начать новый полёт.';
+              document.getElementById('btn-flappy-start').textContent = 'Играть ▶️';
+              ov.classList.remove('hidden');
+            }
+          }
+        },
+
+        flap() {
+          this.bird.vy = -310;
+          Haptic.impact('light');
+          AudioEngine.sfx('tap');
+        },
+
+        spawnPipe() {
+          const groundH = this.GROUND_H;
+          const gap = Math.max(118, Math.min(136, this.h * 0.31));
+          const pipeW = this.PIPE_W;
+          const minTop = 52;
+          const maxTop = Math.max(minTop + 20, this.h - groundH - gap - 56);
+          const topH = minTop + Math.random() * (maxTop - minTop);
+
+          const pipe = { x: this.w + 24, w: pipeW, topH, gap, passed: false };
+          this.pipes.push(pipe);
+          this.pipeCounter++;
+
+          if (this.pipeCounter % 2 === 0 || Math.random() < 0.45) {
+            const coinX = pipe.x + pipeW * 0.5 + (Math.random() < 0.5 ? 0 : 76);
+            const coinBaseY = topH + gap * (0.3 + Math.random() * 0.4);
+            this.coins.push({
+              x: coinX,
+              baseY: Math.max(66, Math.min(this.h - groundH - 54, coinBaseY)),
+              y: coinBaseY,
+              r: 13,
+              phase: Math.random() * Math.PI * 2,
+              collected: false
+            });
+          }
+        },
+
+        addPopup(x, y, text, color) {
+          this.popups.push({ x, y, text, color, life: 0.9, maxLife: 0.9 });
+        },
+
+        async persistRun(passed, earnedCoins) {
+          if (!State.session.pairCode || (!passed && !earnedCoins)) return;
+          const isGf = State.session.role === 'girlfriend';
+          await DB.transact(State.session.pairCode, data => {
+            if (!data.games) data.games = {};
+            if (!data.games.flappy) {
+              data.games.flappy = { girlfriendTotal: 0, boyfriendTotal: 0, girlfriendBest: 0, boyfriendBest: 0 };
+            }
+            const fl = data.games.flappy;
+            if (isGf) {
+              fl.girlfriendTotal = (fl.girlfriendTotal || 0) + passed;
+              if (passed > (fl.girlfriendBest || 0)) fl.girlfriendBest = passed;
+              if (earnedCoins > 0) {
+                data.wallet.coins = (data.wallet.coins || 0) + earnedCoins;
+                data.wallet.totalEarned = (data.wallet.totalEarned || 0) + earnedCoins;
+              }
+            } else {
+              fl.boyfriendTotal = (fl.boyfriendTotal || 0) + passed;
+              if (passed > (fl.boyfriendBest || 0)) fl.boyfriendBest = passed;
+            }
+            return data;
+          });
+        },
+
+        gameOver() {
+          this.state = 'over';
+          cancelAnimationFrame(this.rafId);
+          this.rafId = null;
+          document.body.classList.remove('game-playing');
+          Haptic.notify('error');
+
+          const passed = this.pipesPassed;
+          const coins = this.coinsEarned;
+          const isGf = State.session.role === 'girlfriend';
+
+          this.persistRun(passed, coins);
+
+          const ov = document.getElementById('flappy-overlay');
+          if (ov) {
+            document.getElementById('flappy-overlay-title').textContent = `Пройдено столбов: ${passed}`;
+            document.getElementById('flappy-overlay-sub').textContent = isGf
+              ? (coins > 0 ? `Заработано +${formatNumber(coins)} 🪙 (добавлено на баланс!)` : 'Пролетай между столбами и лови золотые монетки ✨')
+              : 'Результат сохранён в статистике пары ✨';
+            document.getElementById('btn-flappy-start').textContent = 'Играть снова ↻';
+            ov.classList.remove('hidden');
+          }
+          if (isGf && coins > 0) showToast(`+${formatNumber(coins)} 🪙 за игру Flappy Love!`);
+        },
+
+        // Fixed-timestep physics accumulator for jitter-free 60Hz / 120Hz motion
+        loop(ts) {
+          if (this.state !== 'playing') return;
+          if (!this.lastTs) {
+            this.lastTs = ts;
+          }
+          const frameDt = Math.min(0.05, Math.max(0, (ts - this.lastTs) / 1000));
+          this.lastTs = ts;
+          this.accumulator += frameDt;
+
+          let steps = 0;
+          while (this.accumulator >= this.FIXED_DT && steps < 6) {
+            this.update(this.FIXED_DT);
+            if (this.state !== 'playing') break;
+            this.accumulator -= this.FIXED_DT;
+            steps++;
+          }
+          if (steps >= 6) this.accumulator = 0;
+
+          this.drawFrame(ts);
+          if (this.state === 'playing') {
+            this.rafId = requestAnimationFrame(t => this.loop(t));
+          }
+        },
+
+        update(dt) {
+          const gravity = 860;
+          const pipeSpeed = 138;
+          const groundH = this.GROUND_H;
+          const isGf = State.session.role === 'girlfriend';
+
+          this.bird.vy = Math.min(460, this.bird.vy + gravity * dt);
+          this.bird.y += this.bird.vy * dt;
+          const targetRot = Math.max(-0.48, Math.min(1.15, this.bird.vy / 420));
+          this.bird.rot += (targetRot - this.bird.rot) * Math.min(1, dt * 16);
+          this.groundOffset = (this.groundOffset + pipeSpeed * dt) % 28;
+
+          if (this.bird.y - this.bird.r < 0) {
+            this.bird.y = this.bird.r;
+            this.bird.vy = 0;
+          }
+          if (this.bird.y + this.bird.r >= this.h - groundH) {
+            this.bird.y = this.h - groundH - this.bird.r;
+            this.gameOver();
+            return;
+          }
+
+          this.spawnTimer -= dt;
+          if (this.spawnTimer <= 0) {
+            this.spawnPipe();
+            this.spawnTimer = 1.58;
+          }
+
+          const hitR = this.bird.r - 3;
+          let hudDirty = false;
+
+          for (let i = this.pipes.length - 1; i >= 0; i--) {
+            const p = this.pipes[i];
+            p.x -= pipeSpeed * dt;
+            if (!p.passed && p.x + p.w < this.bird.x) {
+              p.passed = true;
+              this.pipesPassed += 1;
+              hudDirty = true;
+              if (isGf) {
+                this.coinsEarned += 1;
+                this.addPopup(this.bird.x + 12, this.bird.y - 24, '+1 🪙', '#ffd166');
+              } else {
+                this.addPopup(this.bird.x + 12, this.bird.y - 24, '+1 ✨', '#5ae2ff');
+              }
+              AudioEngine.sfx('switch');
+            }
+
+            if ((this.bird.x + hitR > p.x) && (this.bird.x - hitR < p.x + p.w)) {
+              if ((this.bird.y - hitR < p.topH) || (this.bird.y + hitR > p.topH + p.gap)) {
+                if (hudDirty) this.updateHud();
+                this.gameOver();
+                return;
+              }
+            }
+            if (p.x + p.w <= -40) this.pipes.splice(i, 1);
+          }
+
+          const collectDistSq = (this.bird.r + 15) * (this.bird.r + 15);
+          for (let i = this.coins.length - 1; i >= 0; i--) {
+            const c = this.coins[i];
+            c.x -= pipeSpeed * dt;
+            c.phase += dt * 4.5;
+            c.y = c.baseY + Math.sin(c.phase) * 9;
+
+            const dx = this.bird.x - c.x;
+            const dy = this.bird.y - c.y;
+            if (dx * dx + dy * dy < collectDistSq) {
+              this.coins.splice(i, 1);
+              Haptic.notify('success');
+              AudioEngine.sfx('coin');
+              if (isGf) {
+                this.coinsEarned += 10;
+                hudDirty = true;
+                this.addPopup(c.x, c.y - 10, '+10 🪙', '#ffe066');
+              } else {
+                this.addPopup(c.x, c.y - 10, '✨', '#5ae2ff');
+              }
+              continue;
+            }
+            if (c.x <= -30) this.coins.splice(i, 1);
+          }
+
+          if (hudDirty) this.updateHud();
+
+          for (let i = this.popups.length - 1; i >= 0; i--) {
+            const pop = this.popups[i];
+            pop.y -= 38 * dt;
+            pop.life -= dt;
+            if (pop.life <= 0) this.popups.splice(i, 1);
+          }
+        },
+
+        drawRoundedRect(ctx, x, y, w, h, r) {
+          const radius = Math.min(r, w / 2, h / 2);
+          ctx.beginPath();
+          ctx.moveTo(x + radius, y);
+          ctx.arcTo(x + w, y, x + w, y + h, radius);
+          ctx.arcTo(x + w, y + h, x, y + h, radius);
+          ctx.arcTo(x, y + h, x, y, radius);
+          ctx.arcTo(x, y, x + w, y, radius);
+          ctx.closePath();
+        },
+
+        drawFrame(ts) {
+          if (!this.ctx) return;
+          const ctx = this.ctx;
+          const w = this.w;
+          const h = this.h;
+          const groundH = this.GROUND_H;
+
+          ctx.clearRect(0, 0, w, h);
+
+          // Cached background gradient
+          ctx.fillStyle = this.skyGrad || 'rgba(34, 14, 48, 0.38)';
+          ctx.fillRect(0, 0, w, h);
+
+          // Pipes using cached gradient via translate (zero per-frame gradient allocation)
+          ctx.fillStyle = this.pipeGrad || 'rgba(255, 107, 169, 0.8)';
+          ctx.strokeStyle = 'rgba(255, 255, 255, 0.48)';
+          ctx.lineWidth = 1.5;
+
+          for (let i = 0; i < this.pipes.length; i++) {
+            const p = this.pipes[i];
+            const px = Math.round(p.x * 2) / 2;
+            const botY = p.topH + p.gap;
+            const botH = h - groundH - botY + 6;
+            const capH = 18;
+
+            ctx.save();
+            ctx.translate(px, 0);
+
+            // Top pipe + cap
+            this.drawRoundedRect(ctx, 0, -6, p.w, p.topH + 6, 8);
+            ctx.fill();
+            ctx.stroke();
+            this.drawRoundedRect(ctx, -4, p.topH - capH, p.w + 8, capH, 6);
+            ctx.fill();
+            ctx.stroke();
+
+            // Bottom pipe + cap
+            this.drawRoundedRect(ctx, 0, botY, p.w, botH, 8);
+            ctx.fill();
+            ctx.stroke();
+            this.drawRoundedRect(ctx, -4, botY, p.w + 8, capH, 6);
+            ctx.fill();
+            ctx.stroke();
+
+            ctx.restore();
+          }
+
+          // Floating coins using pre-rendered sprite (zero shadowBlur cost)
+          if (this.coinSprite && this.coins.length) {
+            const half = this.coinSpriteSize / 2;
+            for (let i = 0; i < this.coins.length; i++) {
+              const c = this.coins[i];
+              ctx.drawImage(this.coinSprite, c.x - half, c.y - half, this.coinSpriteSize, this.coinSpriteSize);
+            }
+          }
+
+          // Ground bar
+          ctx.fillStyle = 'rgba(22, 10, 30, 0.78)';
+          ctx.fillRect(0, h - groundH, w, groundH);
+          ctx.strokeStyle = 'rgba(255, 255, 255, 0.28)';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.moveTo(0, h - groundH);
+          ctx.lineTo(w, h - groundH);
+          ctx.stroke();
+
+          ctx.strokeStyle = 'rgba(255, 107, 169, 0.35)';
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          for (let gx = -this.groundOffset; gx < w + 28; gx += 28) {
+            ctx.moveTo(gx, h - groundH + 6);
+            ctx.lineTo(gx - 12, h - 6);
+          }
+          ctx.stroke();
+
+          // Avatar bird using pre-rendered sprite (zero clip() cost)
+          const b = this.bird;
+          const bobY = this.state === 'idle' ? Math.sin((ts || 0) / 260) * 5.5 : 0;
+          if (this.birdSprite) {
+            const halfB = this.birdSpriteSize / 2;
+            ctx.save();
+            ctx.translate(b.x, b.y + bobY);
+            if (this.state === 'playing') ctx.rotate(b.rot);
+            ctx.drawImage(this.birdSprite, -halfB, -halfB, this.birdSpriteSize, this.birdSpriteSize);
+            ctx.restore();
+          }
+
+          // Floating score popups
+          if (this.popups.length) {
+            ctx.font = '800 15px -apple-system, sans-serif';
+            ctx.textAlign = 'center';
+            for (let i = 0; i < this.popups.length; i++) {
+              const pop = this.popups[i];
+              ctx.globalAlpha = Math.max(0, pop.life / pop.maxLife);
+              ctx.fillStyle = pop.color;
+              ctx.fillText(pop.text, pop.x, pop.y);
+            }
+            ctx.globalAlpha = 1;
           }
         }
       };
@@ -2564,488 +3364,6 @@
             };
             reader.readAsDataURL(file);
           });
-        }
-      };
-
-      /* ======================================================================
-         10. FLAPPY LOVE MINI-GAME (AVATAR BIRD + FLOATING +10 COINS)
-         ====================================================================== */
-      const FlappyGame = {
-        canvas: null,
-        ctx: null,
-        w: 320,
-        h: 400,
-        dpr: 1,
-        rafId: null,
-        lastTs: 0,
-        state: 'idle',
-        bird: { x: 86, y: 170, vy: 0, r: 18, rot: 0 },
-        pipes: [],
-        coins: [],
-        popups: [],
-        groundOffset: 0,
-        spawnTimer: 0,
-        pipesPassed: 0,
-        coinsEarned: 0,
-        pipeCounter: 0,
-        avatarImg: null,
-        avatarSrc: '',
-        avatarReady: false,
-
-        init() {
-          this.canvas = document.getElementById('flappy-canvas');
-          if (!this.canvas) return;
-          this.ctx = this.canvas.getContext('2d');
-          this.resize();
-          window.addEventListener('resize', () => {
-            if (State.activeTab === 'games') this.resize();
-          });
-
-          this.canvas.addEventListener('pointerdown', e => {
-            e.preventDefault();
-            if (this.state === 'playing') this.flap();
-            else if (this.state === 'idle') this.start();
-          });
-
-          document.getElementById('btn-flappy-start')?.addEventListener('click', () => this.start());
-
-          document.addEventListener('keydown', e => {
-            if (State.activeTab !== 'games') return;
-            if (e.code === 'Space' || e.code === 'ArrowUp') {
-              e.preventDefault();
-              if (this.state === 'playing') this.flap();
-              else this.start();
-            }
-          });
-
-          document.addEventListener('visibilitychange', () => {
-            if (document.hidden && this.state === 'playing') {
-              this.stopIfRunning(true);
-            }
-          });
-          this.drawFrame(0);
-        },
-
-        getMyAvatarInfo() {
-          const isGf = State.session.role === 'girlfriend';
-          const meta = State.pairData?.meta || {};
-          const custom = isGf ? meta.girlfriendCustomAvatar : meta.boyfriendCustomAvatar;
-          const url = custom || State.user.photoUrl || (isGf ? meta.girlfriendPhotoUrl : meta.boyfriendPhotoUrl) || '';
-          const name = State.user.name || (isGf ? 'Девушка' : 'Парень');
-          return { url, initial: name.slice(0, 1).toUpperCase() || '💞' };
-        },
-
-        syncAvatarImage() {
-          const { url } = this.getMyAvatarInfo();
-          if (url === this.avatarSrc) return;
-          this.avatarSrc = url;
-          this.avatarReady = false;
-          if (!url) {
-            this.avatarImg = null;
-            return;
-          }
-          const img = new Image();
-          img.referrerPolicy = 'no-referrer';
-          img.onload = () => {
-            this.avatarImg = img;
-            this.avatarReady = true;
-            if (this.state !== 'playing') this.drawFrame(0);
-          };
-          img.onerror = () => {
-            this.avatarImg = null;
-            this.avatarReady = false;
-          };
-          img.src = url.startsWith('data:image/')
-            ? url
-            : `${url}${url.includes('?') ? '&' : '?'}_v=${SESSION_CACHE_BUST}`;
-        },
-
-        resize() {
-          const wrap = document.getElementById('flappy-stage');
-          if (!wrap || !this.canvas) return;
-          const rect = wrap.getBoundingClientRect();
-          if (rect.width < 20 || rect.height < 20) return;
-          this.dpr = Math.min(window.devicePixelRatio || 1, 2);
-          this.w = rect.width;
-          this.h = rect.height;
-          this.canvas.width = Math.round(this.w * this.dpr);
-          this.canvas.height = Math.round(this.h * this.dpr);
-          this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-          if (this.state === 'idle') {
-            this.bird.x = Math.round(this.w * 0.27);
-            this.bird.y = Math.round(this.h * 0.44);
-          }
-          this.drawFrame(0);
-        },
-
-        resetRound() {
-          this.resize();
-          this.syncAvatarImage();
-          this.bird = {
-            x: Math.round(this.w * 0.27),
-            y: Math.round(this.h * 0.44),
-            vy: 0,
-            r: 18,
-            rot: 0
-          };
-          this.pipes = [];
-          this.coins = [];
-          this.popups = [];
-          this.spawnTimer = 0.85;
-          this.pipesPassed = 0;
-          this.coinsEarned = 0;
-          this.pipeCounter = 0;
-          this.updateHud();
-        },
-
-        updateHud() {
-          const sEl = document.getElementById('flappy-live-score');
-          const cEl = document.getElementById('flappy-live-coins');
-          const cWrap = document.getElementById('flappy-live-coins-wrap');
-          if (sEl) sEl.textContent = formatNumber(this.pipesPassed);
-          if (cEl) cEl.textContent = formatNumber(this.coinsEarned);
-          if (cWrap) cWrap.style.display = State.session.role === 'girlfriend' ? 'inline-flex' : 'none';
-        },
-
-        start() {
-          this.resetRound();
-          this.state = 'playing';
-          document.getElementById('flappy-overlay')?.classList.add('hidden');
-          this.flap();
-          this.lastTs = performance.now();
-          cancelAnimationFrame(this.rafId);
-          this.rafId = requestAnimationFrame(ts => this.loop(ts));
-        },
-
-        stopIfRunning(saveProgress = true) {
-          if (this.state === 'playing') {
-            cancelAnimationFrame(this.rafId);
-            this.state = 'idle';
-            if (saveProgress && (this.pipesPassed > 0 || this.coinsEarned > 0)) {
-              this.persistRun(this.pipesPassed, this.coinsEarned);
-            }
-            const ov = document.getElementById('flappy-overlay');
-            if (ov) {
-              document.getElementById('flappy-overlay-title').textContent = 'Пауза ✨';
-              document.getElementById('flappy-overlay-sub').textContent = 'Нажми, чтобы начать новый полёт.';
-              document.getElementById('btn-flappy-start').textContent = 'Играть ▶️';
-              ov.classList.remove('hidden');
-            }
-          }
-        },
-
-        flap() {
-          this.bird.vy = -310;
-          Haptic.impact('light');
-          AudioEngine.sfx('tap');
-        },
-
-        spawnPipe() {
-          const groundH = 38;
-          const gap = Math.max(118, Math.min(136, this.h * 0.31));
-          const pipeW = 54;
-          const minTop = 52;
-          const maxTop = Math.max(minTop + 20, this.h - groundH - gap - 56);
-          const topH = minTop + Math.random() * (maxTop - minTop);
-
-          const pipe = { x: this.w + 24, w: pipeW, topH, gap, passed: false };
-          this.pipes.push(pipe);
-          this.pipeCounter++;
-
-          if (this.pipeCounter % 2 === 0 || Math.random() < 0.45) {
-            const coinX = pipe.x + pipeW * 0.5 + (Math.random() < 0.5 ? 0 : 76);
-            const coinBaseY = topH + gap * (0.3 + Math.random() * 0.4);
-            this.coins.push({
-              x: coinX,
-              baseY: Math.max(66, Math.min(this.h - groundH - 54, coinBaseY)),
-              y: coinBaseY,
-              r: 13,
-              phase: Math.random() * Math.PI * 2,
-              collected: false
-            });
-          }
-        },
-
-        addPopup(x, y, text, color) {
-          this.popups.push({ x, y, text, color, life: 0.9, maxLife: 0.9 });
-        },
-
-        async persistRun(passed, earnedCoins) {
-          if (!State.session.pairCode || (!passed && !earnedCoins)) return;
-          const isGf = State.session.role === 'girlfriend';
-          await DB.transact(State.session.pairCode, data => {
-            if (!data.games) data.games = {};
-            if (!data.games.flappy) {
-              data.games.flappy = { girlfriendTotal: 0, boyfriendTotal: 0, girlfriendBest: 0, boyfriendBest: 0 };
-            }
-            const fl = data.games.flappy;
-            if (isGf) {
-              fl.girlfriendTotal = (fl.girlfriendTotal || 0) + passed;
-              if (passed > (fl.girlfriendBest || 0)) fl.girlfriendBest = passed;
-              if (earnedCoins > 0) {
-                data.wallet.coins = (data.wallet.coins || 0) + earnedCoins;
-                data.wallet.totalEarned = (data.wallet.totalEarned || 0) + earnedCoins;
-              }
-            } else {
-              fl.boyfriendTotal = (fl.boyfriendTotal || 0) + passed;
-              if (passed > (fl.boyfriendBest || 0)) fl.boyfriendBest = passed;
-            }
-            return data;
-          });
-        },
-
-        gameOver() {
-          this.state = 'over';
-          cancelAnimationFrame(this.rafId);
-          Haptic.notify('error');
-
-          const passed = this.pipesPassed;
-          const coins = this.coinsEarned;
-          const isGf = State.session.role === 'girlfriend';
-
-          this.persistRun(passed, coins);
-
-          const ov = document.getElementById('flappy-overlay');
-          if (ov) {
-            document.getElementById('flappy-overlay-title').textContent = `Пройдено столбов: ${passed}`;
-            document.getElementById('flappy-overlay-sub').textContent = isGf
-              ? (coins > 0 ? `Заработано +${formatNumber(coins)} 🪙 (добавлено на баланс!)` : 'Пролетай между столбами и лови золотые монетки ✨')
-              : 'Результат сохранён в статистике пары ✨';
-            document.getElementById('btn-flappy-start').textContent = 'Играть снова ↻';
-            ov.classList.remove('hidden');
-          }
-          if (isGf && coins > 0) showToast(`+${formatNumber(coins)} 🪙 за игру Flappy Love!`);
-        },
-
-        loop(ts) {
-          if (this.state !== 'playing') return;
-          const dt = Math.min(0.035, Math.max(0.004, (ts - this.lastTs) / 1000));
-          this.lastTs = ts;
-          this.update(dt);
-          this.drawFrame(ts);
-          if (this.state === 'playing') {
-            this.rafId = requestAnimationFrame(t => this.loop(t));
-          }
-        },
-
-        update(dt) {
-          const gravity = 860;
-          const pipeSpeed = 138;
-          const groundH = 38;
-          const isGf = State.session.role === 'girlfriend';
-
-          this.bird.vy = Math.min(460, this.bird.vy + gravity * dt);
-          this.bird.y += this.bird.vy * dt;
-          this.bird.rot = Math.max(-0.48, Math.min(1.15, this.bird.vy / 420));
-          this.groundOffset = (this.groundOffset + pipeSpeed * dt) % 28;
-
-          if (this.bird.y - this.bird.r < 0) {
-            this.bird.y = this.bird.r;
-            this.bird.vy = 0;
-          }
-          if (this.bird.y + this.bird.r >= this.h - groundH) {
-            this.bird.y = this.h - groundH - this.bird.r;
-            this.gameOver();
-            return;
-          }
-
-          this.spawnTimer -= dt;
-          if (this.spawnTimer <= 0) {
-            this.spawnPipe();
-            this.spawnTimer = 1.58;
-          }
-
-          const hitR = this.bird.r - 3;
-          for (const p of this.pipes) {
-            p.x -= pipeSpeed * dt;
-            if (!p.passed && p.x + p.w < this.bird.x) {
-              p.passed = true;
-              this.pipesPassed += 1;
-              if (isGf) {
-                this.coinsEarned += 1;
-                this.addPopup(this.bird.x + 12, this.bird.y - 24, '+1 🪙', '#ffd166');
-              } else {
-                this.addPopup(this.bird.x + 12, this.bird.y - 24, '+1 ✨', '#5ae2ff');
-              }
-              AudioEngine.sfx('switch');
-              this.updateHud();
-            }
-
-            const inX = (this.bird.x + hitR > p.x) && (this.bird.x - hitR < p.x + p.w);
-            if (inX) {
-              if ((this.bird.y - hitR < p.topH) || (this.bird.y + hitR > p.topH + p.gap)) {
-                this.gameOver();
-                return;
-              }
-            }
-          }
-          this.pipes = this.pipes.filter(p => p.x + p.w > -40);
-
-          for (const c of this.coins) {
-            if (c.collected) continue;
-            c.x -= pipeSpeed * dt;
-            c.phase += dt * 4.5;
-            c.y = c.baseY + Math.sin(c.phase) * 9;
-
-            if (Math.hypot(this.bird.x - c.x, this.bird.y - c.y) < this.bird.r + c.r + 2) {
-              c.collected = true;
-              Haptic.notify('success');
-              AudioEngine.sfx('coin');
-              if (isGf) {
-                this.coinsEarned += 10;
-                this.addPopup(c.x, c.y - 10, '+10 🪙', '#ffe066');
-                this.updateHud();
-              } else {
-                this.addPopup(c.x, c.y - 10, '✨', '#5ae2ff');
-              }
-            }
-          }
-          this.coins = this.coins.filter(c => !c.collected && c.x > -30);
-
-          for (const pop of this.popups) {
-            pop.y -= 36 * dt;
-            pop.life -= dt;
-          }
-          this.popups = this.popups.filter(pop => pop.life > 0);
-        },
-
-        drawRoundedRect(ctx, x, y, w, h, r) {
-          const radius = Math.min(r, w / 2, h / 2);
-          ctx.beginPath();
-          ctx.moveTo(x + radius, y);
-          ctx.arcTo(x + w, y, x + w, y + h, radius);
-          ctx.arcTo(x + w, y + h, x, y + h, radius);
-          ctx.arcTo(x, y + h, x, y, radius);
-          ctx.arcTo(x, y, x + w, y, radius);
-          ctx.closePath();
-        },
-
-        drawFrame(ts) {
-          if (!this.ctx) return;
-          const ctx = this.ctx;
-          const w = this.w;
-          const h = this.h;
-          const groundH = 38;
-
-          ctx.clearRect(0, 0, w, h);
-
-          const skyGrad = ctx.createLinearGradient(0, 0, 0, h);
-          skyGrad.addColorStop(0, 'rgba(34, 14, 48, 0.42)');
-          skyGrad.addColorStop(1, 'rgba(66, 20, 56, 0.32)');
-          ctx.fillStyle = skyGrad;
-          ctx.fillRect(0, 0, w, h);
-
-          for (const p of this.pipes) {
-            const drawPillar = (x, y, pw, ph, capAtBottom) => {
-              const grad = ctx.createLinearGradient(x, 0, x + pw, 0);
-              grad.addColorStop(0, 'rgba(255, 107, 169, 0.72)');
-              grad.addColorStop(0.5, 'rgba(255, 175, 212, 0.85)');
-              grad.addColorStop(1, 'rgba(182, 68, 136, 0.78)');
-              ctx.fillStyle = grad;
-              ctx.strokeStyle = 'rgba(255, 255, 255, 0.48)';
-              ctx.lineWidth = 1.5;
-
-              this.drawRoundedRect(ctx, x, y, pw, ph, 8);
-              ctx.fill();
-              ctx.stroke();
-
-              const capH = 18;
-              const capY = capAtBottom ? (y + ph - capH) : y;
-              this.drawRoundedRect(ctx, x - 4, capY, pw + 8, capH, 6);
-              ctx.fill();
-              ctx.stroke();
-            };
-
-            drawPillar(p.x, -6, p.w, p.topH + 6, true);
-            const botY = p.topH + p.gap;
-            drawPillar(p.x, botY, p.w, h - groundH - botY + 6, false);
-          }
-
-          for (const c of this.coins) {
-            ctx.save();
-            ctx.translate(c.x, c.y);
-            ctx.shadowColor = 'rgba(255, 209, 102, 0.85)';
-            ctx.shadowBlur = 14;
-            const cg = ctx.createRadialGradient(-3, -3, 2, 0, 0, c.r);
-            cg.addColorStop(0, '#fff7b2');
-            cg.addColorStop(0.6, '#ffd166');
-            cg.addColorStop(1, '#f4a226');
-            ctx.fillStyle = cg;
-            ctx.beginPath();
-            ctx.arc(0, 0, c.r, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.lineWidth = 2;
-            ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
-            ctx.stroke();
-
-            ctx.shadowBlur = 0;
-            ctx.fillStyle = '#5c3400';
-            ctx.font = '800 10px -apple-system, sans-serif';
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            ctx.fillText('10', 0, 0.5);
-            ctx.restore();
-          }
-
-          ctx.fillStyle = 'rgba(22, 10, 30, 0.78)';
-          ctx.fillRect(0, h - groundH, w, groundH);
-          ctx.strokeStyle = 'rgba(255, 255, 255, 0.28)';
-          ctx.lineWidth = 1.5;
-          ctx.beginPath();
-          ctx.moveTo(0, h - groundH);
-          ctx.lineTo(w, h - groundH);
-          ctx.stroke();
-
-          ctx.strokeStyle = 'rgba(255, 107, 169, 0.35)';
-          ctx.lineWidth = 2;
-          for (let gx = -this.groundOffset; gx < w + 28; gx += 28) {
-            ctx.beginPath();
-            ctx.moveTo(gx, h - groundH + 6);
-            ctx.lineTo(gx - 12, h - 6);
-            ctx.stroke();
-          }
-
-          const b = this.bird;
-          const bobY = this.state === 'idle' ? Math.sin((ts || 0) / 260) * 5 : 0;
-          ctx.save();
-          ctx.translate(b.x, b.y + bobY);
-          ctx.rotate(this.state === 'playing' ? b.rot : 0);
-
-          ctx.beginPath();
-          ctx.arc(0, 0, b.r + 2.5, 0, Math.PI * 2);
-          ctx.fillStyle = 'rgba(90, 226, 255, 0.9)';
-          ctx.fill();
-
-          ctx.save();
-          ctx.beginPath();
-          ctx.arc(0, 0, b.r, 0, Math.PI * 2);
-          ctx.clip();
-          if (this.avatarReady && this.avatarImg) {
-            ctx.drawImage(this.avatarImg, -b.r, -b.r, b.r * 2, b.r * 2);
-          } else {
-            const ag = ctx.createLinearGradient(-b.r, -b.r, b.r, b.r);
-            ag.addColorStop(0, '#ff6ba9');
-            ag.addColorStop(1, '#7b4dff');
-            ctx.fillStyle = ag;
-            ctx.fillRect(-b.r, -b.r, b.r * 2, b.r * 2);
-            ctx.fillStyle = '#fff';
-            ctx.font = '800 16px -apple-system, sans-serif';
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            ctx.fillText(this.getMyAvatarInfo().initial, 0, 1);
-          }
-          ctx.restore();
-          ctx.restore();
-
-          for (const pop of this.popups) {
-            ctx.save();
-            ctx.globalAlpha = Math.max(0, pop.life / pop.maxLife);
-            ctx.font = '800 15px -apple-system, sans-serif';
-            ctx.fillStyle = pop.color;
-            ctx.textAlign = 'center';
-            ctx.fillText(pop.text, pop.x, pop.y);
-            ctx.restore();
-          }
         }
       };
 
@@ -3475,15 +3793,20 @@
         if (!State.session.pairCode || !State.session.role || !State.pairData) return;
         const isGf = State.session.role === 'girlfriend';
         const now = Date.now();
+        const uClean = DB.sanitizeUsername(State.user.username);
         await DB.transact(State.session.pairCode, cur => {
           if (isGf) {
             cur.meta.girlfriendLastSeen = now;
             if (!cur.meta.girlfriendName && State.user.name) cur.meta.girlfriendName = State.user.name;
             if (State.user.photoUrl) cur.meta.girlfriendPhotoUrl = State.user.photoUrl;
+            if (uClean) cur.meta.girlfriendUsername = uClean;
+            if (State.user.id) cur.meta.girlfriendTgId = State.user.id;
           } else {
             cur.meta.boyfriendLastSeen = now;
             if (!cur.meta.boyfriendName && State.user.name) cur.meta.boyfriendName = State.user.name;
             if (State.user.photoUrl) cur.meta.boyfriendPhotoUrl = State.user.photoUrl;
+            if (uClean) cur.meta.boyfriendUsername = uClean;
+            if (State.user.id) cur.meta.boyfriendTgId = State.user.id;
           }
           return cur;
         });
@@ -3494,9 +3817,12 @@
         const u = tg.initDataUnsafe.user;
         const newName = [u.first_name, u.last_name].filter(Boolean).join(' ').trim() || u.username || State.user.name;
         const newPhoto = u.photo_url || State.user.photoUrl;
+        if (u.id) State.user.id = String(u.id);
+        if (u.username) State.user.username = u.username.trim();
         State.user.name = newName;
         State.user.photoUrl = newPhoto;
         if (State.pairData) {
+          DB.bindAccount(State.user, State.session.pairCode, State.session.role);
           touchProfileAndSeen();
           renderAll();
         }
@@ -3511,18 +3837,31 @@
         document.getElementById('app-shell').classList.add('active');
 
         const cached = await SessionStore.loadSnapshot(code);
-        if (cached) onPairSnapshot(normalizePairData(cached, code));
+        if (cached) {
+          onPairSnapshot(normalizePairData(cached, code));
+        }
+
+        // Link Telegram username & ID to this pair in DB for seamless future auto-login
+        DB.bindAccount(State.user, code, role);
 
         DB.subscribe(code, data => {
-          const isFirst = !State.pairData;
           onPairSnapshot(data);
-          if (isFirst) touchProfileAndSeen();
         });
+
+        const fresh = await DB.get(code);
+        if (fresh) {
+          onPairSnapshot(fresh);
+          touchProfileAndSeen();
+        }
       }
 
+      let tabGlideTimer = null;
+
       function switchTab(tabName, index) {
+        if (State.activeTab === tabName) return;
         if (State.activeTab === 'games' && tabName !== 'games') {
           FlappyGame.stopIfRunning(true);
+          FlappyGame.stopIdleLoop();
         }
         State.activeTab = tabName;
         Haptic.select();
@@ -3536,12 +3875,18 @@
         });
 
         const ind = document.getElementById('tabbar-indicator');
-        if (ind) ind.style.transform = `translateX(${index * 100}%)`;
+        if (ind) {
+          ind.style.setProperty('--tab-idx', String(index));
+          ind.classList.add('gliding');
+          clearTimeout(tabGlideTimer);
+          tabGlideTimer = setTimeout(() => ind.classList.remove('gliding'), 190);
+        }
 
         if (tabName === 'games') {
           requestAnimationFrame(() => {
             FlappyGame.resize();
             FlappyGame.syncAvatarImage();
+            FlappyGame.startIdleLoop();
           });
           setTimeout(() => {
             FlappyGame.resize();
@@ -4090,6 +4435,7 @@
             FlappyGame.stopIfRunning(false);
             DB.unsubscribe();
             State.pairData = null;
+            await DB.unbindAccount(State.user);
             await SessionStore.clearPair();
             document.getElementById('app-shell').classList.remove('active');
             document.getElementById('onboarding-screen').classList.add('active');
@@ -4125,8 +4471,21 @@
           if (saved && saved.pairCode && saved.role) {
             await connectToPair(saved.pairCode, saved.role);
           } else {
-            document.getElementById('onboard-name-input').value = State.user.name || '';
-            document.getElementById('onboarding-screen').classList.add('active');
+            // Check if this Telegram username (or ID) is already bound to a pair in Firebase
+            const binding = await DB.findAccountBinding(State.user);
+            if (binding && binding.pairCode && binding.role) {
+              const pairExists = await DB.get(binding.pairCode);
+              if (pairExists) {
+                await connectToPair(binding.pairCode, binding.role);
+                showToast('Вход выполнен по аккаунту Telegram ✨');
+              } else {
+                document.getElementById('onboard-name-input').value = State.user.name || '';
+                document.getElementById('onboarding-screen').classList.add('active');
+              }
+            } else {
+              document.getElementById('onboard-name-input').value = State.user.name || '';
+              document.getElementById('onboarding-screen').classList.add('active');
+            }
           }
 
           setInterval(updateCountdown, 1000);
